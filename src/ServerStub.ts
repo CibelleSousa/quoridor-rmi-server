@@ -38,10 +38,14 @@ export class ServerStub {
         );
       }
 
+      // Contexto de Roteamento para Logging (Identifica se é Lobby ou Sala específica)
+      const isLobbyMethod = ['createRoom', 'listRooms'].includes(method as string);
+      const roomLog = (!isLobbyMethod && args.length > 0) ? `[Sala: ${args[0]}]` : `[Lobby Registry]`;
+
       // Evita poluir o console do servidor com chamadas periódicas de leitura de estado
       if (method !== 'getGameState') {
         console.log(
-          `📥 [Server Stub] Invocação local -> ${String(method)}(${JSON.stringify(args)})`
+          `📥 [Server Stub] ${roomLog} Invocação local -> ${String(method)}(${JSON.stringify(args)})`
         );
       }
 

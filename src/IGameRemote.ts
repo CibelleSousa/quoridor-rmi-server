@@ -9,14 +9,14 @@ export type PlayerColor = 'N' | 'S' | 'W' | 'E';
 
 /**
  * Orientação das barreiras (paredes) posicionadas no tabuleiro.
- * - H: Horizontal (bloqueia passagem vertical entre duas linhas em 2 colunas adjacentes).
- * - V: Vertical (bloqueia passagem horizontal entre duas colunas em 2 linhas adjacentes).
+ * - H: Horizontal (bloqueia passagem vertical entre duas linhas).
+ * - V: Vertical (bloqueia passagem horizontal entre duas colunas).
  */
 export type WallOrientation = 'H' | 'V';
 
 /**
  * Representa uma parede posicionada no tabuleiro 9x9.
- * A coordenada (row, col) indica o ponto superior-esquerdo da parede de tamanho 2 (0 <= row, col <= 7).
+ * A coordenada (row, col) indica a âncora superior-esquerda da parede de tamanho 2.
  */
 export interface Wall {
   row: number;
@@ -26,7 +26,7 @@ export interface Wall {
 }
 
 /**
- * Representa um dos 4 jogadores remotos na partida de Quoridor.
+ * Representa o estado de um nó cliente (jogador) na partida de Quoridor.
  */
 export interface Player {
   id: string;
@@ -40,9 +40,21 @@ export interface Player {
 }
 
 /**
- * Representa o estado global sincronizado da partida distribuída de Quoridor.
+ * DTO (Data Transfer Object) para listagem pública de salas no Lobby (RMI Registry).
+ */
+export interface RoomInfo {
+  roomId: string;
+  name: string;
+  playersCount: number;
+  status: 'WAITING_PLAYERS' | 'IN_PROGRESS' | 'FINISHED';
+}
+
+/**
+ * Representa o estado global e sincronizado de uma instância específica de partida distribuída.
  */
 export interface GameState {
+  roomId: string;
+  roomName: string;
   boardSize: number;
   players: Player[];
   walls: Wall[];
@@ -53,37 +65,53 @@ export interface GameState {
 }
 
 /**
- * INTERFACE REMOTA (Equivalente a `java.rmi.Remote` apresentada nos slides).
- * Define o contrato de métodos que podem ser invocados remotamente pelos processos clientes
- * através do Apêndice do Cliente (Client Stub).
+ * INTERFACE REMOTA (IDL - Interface Definition Language).
+ * Define o contrato estrito de métodos remotos expostos pelo servidor.
+ * Atua duplamente como um serviço de Diretório (Lobby) e Despachante de Ações (Game).
  */
 export interface IGameRemote {
   /**
-   * Registra um novo jogador remoto na partida (máximo de 4 jogadores).
+   * Instancia dinamicamente um novo objeto remoto de partida no servidor.
+   * @param roomName Nome de exibição da sala.
+   * @returns O identificador único (UUID) da sala recém-criada, usado para roteamento.
+   */
+  createRoom(roomName: string): Promise<string>;
+
+  /**
+   * Consulta o serviço de diretório para obter as salas disponíveis.
+   * @returns Lista contendo metadados das partidas instanciadas.
+   */
+  listRooms(): Promise<RoomInfo[]>;
+
+  /**
+   * Registra um processo cliente em uma instância de partida isolada.
+   * @param roomId Chave de roteamento da sala.
    * @param playerName Nome de exibição do jogador.
-   * @returns Objeto contendo os dados do jogador instanciado e o estado atualizado do jogo.
+   * @returns Os dados do jogador instanciado e o estado atualizado da sala.
    */
-  joinGame(playerName: string): Promise<{ player: Player; state: GameState }>;
+  joinGame(roomId: string, playerName: string): Promise<{ player: Player; state: GameState }>;
 
   /**
-   * Move o peão do jogador para uma casa adjacente (ou realiza um salto válido sobre outro peão).
-   * @param playerId Identificador único do jogador que está realizando o movimento.
-   * @param targetRow Linha de destino no tabuleiro 9x9 (0 a 8).
-   * @param targetCol Coluna de destino no tabuleiro 9x9 (0 a 8).
-   * @returns O estado atualizado da partida após a movimentação.
+   * Injeta um evento de movimentação no estado da instância isolada.
+   * @param roomId Chave de roteamento da sala.
+   * @param playerId Identificador único do cliente que detém o turno.
+   * @param targetRow Linha de destino no tabuleiro 9x9.
+   * @param targetCol Coluna de destino no tabuleiro 9x9.
+   * @returns O estado sincronizado após validação das regras de negócio.
    */
-  movePawn(playerId: string, targetRow: number, targetCol: number): Promise<GameState>;
+  movePawn(roomId: string, playerId: string, targetRow: number, targetCol: number): Promise<GameState>;
 
   /**
-   * Posiciona uma barreira (parede de 2 blocos) no tabuleiro, validando se não bloqueia
-   * completamente o caminho de nenhum dos 4 jogadores até seus objetivos ( via algoritmo BFS).
-   * @param playerId Identificador único do jogador que está posicionando a parede.
-   * @param row Coordenada de linha da âncora da parede (0 a 7).
-   * @param col Coordenada de coluna da âncora da parede (0 a 7).
-   * @param orientation Orientação da parede ('H' para Horizontal ou 'V' para Vertical).
-   * @returns O estado atualizado da partida após o posicionamento da parede.
+   * Solicita o posicionamento de uma barreira na instância isolada (sujeito à validação BFS).
+   * @param roomId Chave de roteamento da sala.
+   * @param playerId Identificador único do cliente que detém o turno.
+   * @param row Coordenada de linha da âncora da parede.
+   * @param col Coordenada de coluna da âncora da parede.
+   * @param orientation Orientação geométrica da parede ('H' ou 'V').
+   * @returns O estado sincronizado após validação de rotas residuais.
    */
   placeWall(
+    roomId: string,
     playerId: string,
     row: number,
     col: number,
@@ -91,21 +119,22 @@ export interface IGameRemote {
   ): Promise<GameState>;
 
   /**
-   * Consulta o estado atual da partida no servidor (Sincronização de estado).
-   * @returns O estado atual completo do jogo.
+   * Realiza polling do estado da instância isolada para sincronização de views do cliente.
+   * @param roomId Chave de roteamento da sala.
+   * @returns A fotografia atual (snapshot) do estado da partida.
    */
-  getGameState(): Promise<GameState>;
+  getGameState(roomId: string): Promise<GameState>;
 
   /**
-   * Reinicia o tabuleiro, as posições dos peões e o estoque de paredes para uma nova partida,
-   * mantendo os jogadores já conectados.
-   * @returns O estado reiniciado do jogo.
+   * Emite comando para reinicializar a máquina de estados da partida correspondente.
+   * @param roomId Chave de roteamento da sala.
+   * @returns O novo estado inicializado.
    */
-  resetGame(): Promise<GameState>;
+  resetGame(roomId: string): Promise<GameState>;
 }
 
 /**
- * Estrutura da mensagem de requisição empacotada pelo Apêndice do Cliente (Marshalling).
+ * Estrutura serializável da mensagem de requisição de invocação (Marshalling).
  */
 export interface RMIRPCRequest {
   requestId: string;
@@ -114,7 +143,7 @@ export interface RMIRPCRequest {
 }
 
 /**
- * Estrutura da mensagem de resposta empacotada pelo Apêndice do Servidor (Server Stub).
+ * Estrutura serializável da mensagem de resposta da invocação remota.
  */
 export interface RMIRPCResponse {
   requestId: string;

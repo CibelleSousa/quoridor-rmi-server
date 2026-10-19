@@ -5,14 +5,14 @@ import { ServerStub } from './ServerStub';
 const PORT = process.env.PORT || 4000;
 
 /**
- * 1. Instancia o Objeto Remoto Real (Motor do Quoridor para 4 jogadores)
+ * 1. Instancia o Objeto Remoto Real (Gerenciador de Salas / Lobby)
  */
-const gameEngine = new GameEngine();
+const gameManager = new GameEngine();
 
 /**
  * 2. Vincula o Objeto Remoto ao Apêndice do Servidor (Server Stub)
  */
-const serverStub = new ServerStub(gameEngine);
+const serverStub = new ServerStub(gameManager);
 
 /**
  * Servidor de Transporte RMI/RPC operando sob o paradigma Solicitação/Resposta HTTP (Sem uso de Sockets diretos).
@@ -62,8 +62,8 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`==============================================================`);
-  console.log(`🚀 Servidor RMI Quoridor (4 Jogadores) rodando na porta ${PORT}`);
+  console.log(`🚀 Servidor RMI Quoridor (Lobby e Múltiplas Salas) na porta ${PORT}`);
   console.log(`🔗 Endpoint de Invocação Remota: http://localhost:${PORT}/rmi`);
-  console.log(`📦 Objeto Remoto Registrado: GameEngine -> IGameRemote`);
+  console.log(`📦 Objeto Remoto Registrado: LobbyManager -> IGameRemote`);
   console.log(`==============================================================`);
 });

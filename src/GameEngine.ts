@@ -5,6 +5,7 @@ import {
   PlayerColor,
   Wall,
   WallOrientation,
+  RoomInfo
 } from './IGameRemote';
 import { randomUUID } from 'crypto';
 
@@ -13,7 +14,7 @@ const MAX_PLAYERS = 4;
 const INITIAL_WALLS_PER_PLAYER = 5;
 
 /**
- * Configuração inicial de cada um dos 4 jogadores no tabuleiro 9x9.
+ * Matriz de configuração imutável para a geometria inicial de cada nó cliente (jogador).
  */
 const PLAYER_CONFIGS: {
   color: PlayerColor;
@@ -30,37 +31,34 @@ const PLAYER_CONFIGS: {
 ];
 
 /**
- * OBJETO REMOTO REAL (Equivalente à classe `ComputeEngine` do diagrama UML dos slides).
- * Implementa a interface remota `IGameRemote` e mantém o estado autoritativo da partida de Quoridor.
+ * CONTEXTO DE EXECUÇÃO ISOLADO (Game Instance).
+ * Representa uma sessão de jogo específica. Esta classe não lida com a rede diretamente;
+ * ela atua como a máquina de estados pura para as regras de negócio do Quoridor.
  */
-export class GameEngine implements IGameRemote {
-  private state: GameState;
+class GameInstance {
+  public state: GameState;
 
-  constructor() {
-    this.state = this.createInitialState();
+  constructor(roomId: string, roomName: string) {
+    this.state = this.createInitialState(roomId, roomName);
   }
 
-  /**
-   * Cria o estado inicial limpo para uma partida de Quoridor 9x9.
-   */
-  private createInitialState(): GameState {
+  private createInitialState(roomId: string, roomName: string): GameState {
     return {
+      roomId,
+      roomName,
       boardSize: BOARD_SIZE,
       players: [],
       walls: [],
       currentTurnIndex: 0,
       status: 'WAITING_PLAYERS',
       winner: null,
-      lastActionDescription: 'Aguardando os 4 jogadores remotos se conectarem...',
+      lastActionDescription: 'Aguardando alocação de processos clientes remotos...',
     };
   }
 
-  /**
-   * @inheritdoc
-   */
   public async joinGame(playerName: string): Promise<{ player: Player; state: GameState }> {
     if (this.state.players.length >= MAX_PLAYERS) {
-      throw new Error('A partida já atingiu o limite máximo de 4 jogadores remotos.');
+      throw new Error('Capacidade da sala esgotada (máximo de 4 conexões).');
     }
 
     const idx = this.state.players.length;
@@ -81,57 +79,38 @@ export class GameEngine implements IGameRemote {
 
     if (this.state.players.length === MAX_PLAYERS) {
       this.state.status = 'IN_PROGRESS';
-      this.state.lastActionDescription = `Os 4 jogadores entraram! Vez de ${this.state.players[0].name}.`;
+      this.state.lastActionDescription = `Quorum atingido. Turno inicial transferido para ${this.state.players[0].name}.`;
     } else {
-      this.state.lastActionDescription = `${newPlayer.name} entrou na partida (${this.state.players.length}/4).`;
+      this.state.lastActionDescription = `${newPlayer.name} vinculado à sessão (${this.state.players.length}/${MAX_PLAYERS}).`;
     }
 
     return { player: newPlayer, state: this.state };
   }
 
-  /**
-   * @inheritdoc
-   */
   public async movePawn(playerId: string, targetRow: number, targetCol: number): Promise<GameState> {
     this.validateTurn(playerId);
     const currentPlayer = this.state.players[this.state.currentTurnIndex];
 
-    if (
-      targetRow < 0 ||
-      targetRow >= BOARD_SIZE ||
-      targetCol < 0 ||
-      targetCol >= BOARD_SIZE
-    ) {
-      throw new Error('Coordenadas fora dos limites do tabuleiro 9x9.');
+    if (targetRow < 0 || targetRow >= BOARD_SIZE || targetCol < 0 || targetCol >= BOARD_SIZE) {
+      throw new Error('Exceção geométrica: Coordenadas violam os limites do espaço 9x9.');
     }
 
-    // Verifica se já existe outro peão na casa de destino
     if (this.isCellOccupied(targetRow, targetCol)) {
-      throw new Error('Já existe um peão ocupando esta casa!');
+      throw new Error('Violação de estado: O vértice de destino já está alocado.');
     }
 
-    // Verifica se o movimento (passo simples ou salto sobre adversário) é válido
-    const isValid = this.isValidPawnMove(
-      currentPlayer.row,
-      currentPlayer.col,
-      targetRow,
-      targetCol
-    );
-
-    if (!isValid) {
-      throw new Error('Movimento inválido! Mova 1 casa ortogonal sem atravessar paredes (ou pule um peão adjacente).');
+    if (!this.isValidPawnMove(currentPlayer.row, currentPlayer.col, targetRow, targetCol)) {
+      throw new Error('Transição inválida segundo as regras de topologia do Quoridor.');
     }
 
-    // Atualiza a posição do peão
     currentPlayer.row = targetRow;
     currentPlayer.col = targetCol;
-    this.state.lastActionDescription = `${currentPlayer.name} moveu o peão para (${targetRow + 1}, ${targetCol + 1}).`;
+    this.state.lastActionDescription = `${currentPlayer.name} transicionou para (${targetRow + 1}, ${targetCol + 1}).`;
 
-    // Verifica condição de vitória (alcançou a linha ou coluna objetivo no lado oposto)
     if (this.hasPlayerReachedGoal(currentPlayer)) {
       this.state.status = 'FINISHED';
       this.state.winner = currentPlayer;
-      this.state.lastActionDescription = `🏆 ${currentPlayer.name} alcançou o lado oposto e venceu a partida!`;
+      this.state.lastActionDescription = `🏆 Condição de parada atingida. ${currentPlayer.name} venceu a sessão!`;
     } else {
       this.advanceTurn();
     }
@@ -139,9 +118,6 @@ export class GameEngine implements IGameRemote {
     return this.state;
   }
 
-  /**
-   * @inheritdoc
-   */
   public async placeWall(
     playerId: string,
     row: number,
@@ -152,55 +128,39 @@ export class GameEngine implements IGameRemote {
     const currentPlayer = this.state.players[this.state.currentTurnIndex];
 
     if (currentPlayer.wallsRemaining <= 0) {
-      throw new Error('Você não possui mais barreiras disponíveis!');
+      throw new Error('Recursos esgotados: Cota de barreiras do nó atingida.');
     }
 
     if (row < 0 || row > 7 || col < 0 || col > 7) {
-      throw new Error('Coordenadas de parede inválidas (devem estar entre 0 e 7).');
+      throw new Error('Vetor de posicionamento inválido.');
     }
 
-    // Verifica colisão ou cruzamento com paredes já existentes
     if (this.doesWallOverlapOrCross(row, col, orientation)) {
-      throw new Error('Esta posição colide ou cruza com uma barreira já existente!');
+      throw new Error('Colisão detectada na matriz geométrica do tabuleiro.');
     }
 
-    const candidateWall: Wall = {
-      row,
-      col,
-      orientation,
-      ownerId: currentPlayer.id,
-    };
-
-    // Adiciona temporariamente a parede para testar se todos os 4 jogadores mantêm pelo menos 1 caminho livre (BFS)
+    const candidateWall: Wall = { row, col, orientation, ownerId: currentPlayer.id };
     this.state.walls.push(candidateWall);
-    const allPlayersCanReachGoal = this.state.players.every((p) =>
-      this.canPlayerReachGoalBFS(p)
-    );
+
+    // Validação de Grafo: Garante que o grafo permaneça conexo para o objetivo de todos os nós
+    const allPlayersCanReachGoal = this.state.players.every((p) => this.canPlayerReachGoalBFS(p));
 
     if (!allPlayersCanReachGoal) {
-      this.state.walls.pop(); // Desfaz a parede ilegal
-      throw new Error('Regra do Quoridor: Você não pode trancar completamente o caminho de um jogador até o objetivo!');
+      this.state.walls.pop();
+      throw new Error('Bloqueio Ilegal de Rota (Regra anti-deadlock): Todos os nós devem ter um caminho válido.');
     }
 
     currentPlayer.wallsRemaining -= 1;
-    this.state.lastActionDescription = `${currentPlayer.name} posicionou uma parede ${
-      orientation === 'H' ? 'Horizontal' : 'Vertical'
-    } em (${row + 1}, ${col + 1}).`;
+    this.state.lastActionDescription = `${currentPlayer.name} instanciou uma barreira ${orientation} em (${row + 1}, ${col + 1}).`;
 
     this.advanceTurn();
     return this.state;
   }
 
-  /**
-   * @inheritdoc
-   */
   public async getGameState(): Promise<GameState> {
     return this.state;
   }
 
-  /**
-   * @inheritdoc
-   */
   public async resetGame(): Promise<GameState> {
     this.state.walls = [];
     this.state.currentTurnIndex = 0;
@@ -213,211 +173,173 @@ export class GameEngine implements IGameRemote {
       p.wallsRemaining = INITIAL_WALLS_PER_PLAYER;
     });
 
-    this.state.status =
-      this.state.players.length === MAX_PLAYERS ? 'IN_PROGRESS' : 'WAITING_PLAYERS';
-    this.state.lastActionDescription = 'Partida reiniciada! Tabuleiro limpo e barreiras restauradas.';
+    this.state.status = this.state.players.length === MAX_PLAYERS ? 'IN_PROGRESS' : 'WAITING_PLAYERS';
+    this.state.lastActionDescription = 'Reset de sessão concluído com sucesso.';
 
     return this.state;
   }
 
-  /**
-   * Valida se a partida está em andamento e se o jogador que invocou o método remoto detém o turno atual.
-   */
+  // --- Métodos privados utilitários e de heurística do Grafo foram mantidos exatos como na refatoração ---
+
   private validateTurn(playerId: string): void {
     if (this.state.status === 'WAITING_PLAYERS') {
-      throw new Error(
-        `Aguardando os 4 jogadores entrarem (${this.state.players.length}/4 conectados).`
-      );
+      throw new Error('Estado prematuro: Aguardando sincronização do quorum de 4 processos.');
     }
     if (this.state.status === 'FINISHED') {
-      throw new Error('A partida já foi encerrada.');
+      throw new Error('Estado finalizado: A sessão não aceita novas transições.');
     }
 
     const currentPlayer = this.state.players[this.state.currentTurnIndex];
     if (!currentPlayer || currentPlayer.id !== playerId) {
-      throw new Error(`Não é a sua vez! Turno atual: ${currentPlayer?.name}.`);
+      throw new Error('Violação de exclusão mútua de turno.');
     }
   }
 
-  /**
-   * Avança o turno circularmente entre os 4 jogadores (0 -> 1 -> 2 -> 3 -> 0).
-   */
   private advanceTurn(): void {
     this.state.currentTurnIndex = (this.state.currentTurnIndex + 1) % MAX_PLAYERS;
   }
 
-  /**
-   * Verifica se uma célula (r, c) está ocupada por algum dos 4 peões.
-   */
   private isCellOccupied(r: number, c: number): boolean {
     return this.state.players.some((p) => p.row === r && p.col === c);
   }
 
-  /**
-   * Verifica se há uma parede bloqueando o passo direto entre duas células ortogonalmente adjacentes.
-   */
   private isBlockedByWall(r1: number, c1: number, r2: number, c2: number): boolean {
-    // Movimento Vertical (mesma coluna, linhas adjacentes)
     if (c1 === c2 && Math.abs(r1 - r2) === 1) {
       const minRow = Math.min(r1, r2);
-      return this.state.walls.some(
-        (w) =>
-          w.orientation === 'H' &&
-          w.row === minRow &&
-          (w.col === c1 || w.col === c1 - 1)
-      );
+      return this.state.walls.some((w) => w.orientation === 'H' && w.row === minRow && (w.col === c1 || w.col === c1 - 1));
     }
-
-    // Movimento Horizontal (mesma linha, colunas adjacentes)
     if (r1 === r2 && Math.abs(c1 - c2) === 1) {
       const minCol = Math.min(c1, c2);
-      return this.state.walls.some(
-        (w) =>
-          w.orientation === 'V' &&
-          w.col === minCol &&
-          (w.row === r1 || w.row === r1 - 1)
-      );
+      return this.state.walls.some((w) => w.orientation === 'V' && w.col === minCol && (w.row === r1 || w.row === r1 - 1));
     }
-
     return true;
   }
 
-  /**
-   * Valida se o peão pode ir de (r1, c1) para (r2, c2), considerando passos simples e saltos sobre peões.
-   */
   private isValidPawnMove(r1: number, c1: number, r2: number, c2: number): boolean {
     const dRow = Math.abs(r1 - r2);
     const dCol = Math.abs(c1 - c2);
 
-    // 1. Passo ortogonal simples (distância Manhattan = 1)
-    if (dRow + dCol === 1) {
-      return !this.isBlockedByWall(r1, c1, r2, c2);
-    }
+    if (dRow + dCol === 1) return !this.isBlockedByWall(r1, c1, r2, c2);
 
-    // 2. Salto em linha reta sobre um peão adjacente (distância = 2 na mesma linha ou coluna)
     if ((dRow === 2 && dCol === 0) || (dRow === 0 && dCol === 2)) {
       const midR = (r1 + r2) / 2;
       const midC = (c1 + c2) / 2;
-      if (
-        this.isCellOccupied(midR, midC) &&
-        !this.isBlockedByWall(r1, c1, midR, midC) &&
-        !this.isBlockedByWall(midR, midC, r2, c2)
-      ) {
+      if (this.isCellOccupied(midR, midC) && !this.isBlockedByWall(r1, c1, midR, midC) && !this.isBlockedByWall(midR, midC, r2, c2)) {
         return true;
       }
     }
 
-    // 3. Salto diagonal (permitido quando há um peão adjacente e uma parede ou outro peão atrás dele)
     if (dRow === 1 && dCol === 1) {
-      // Tentativa via vizinho vertical (r2, c1)
-      if (
-        this.isCellOccupied(r2, c1) &&
-        !this.isBlockedByWall(r1, c1, r2, c1) &&
-        !this.isBlockedByWall(r2, c1, r2, c2)
-      ) {
+      if (this.isCellOccupied(r2, c1) && !this.isBlockedByWall(r1, c1, r2, c1) && !this.isBlockedByWall(r2, c1, r2, c2)) {
         const behindR = r2 + (r2 - r1);
-        const blockedBehind =
-          behindR < 0 ||
-          behindR >= BOARD_SIZE ||
-          this.isBlockedByWall(r2, c1, behindR, c1) ||
-          this.isCellOccupied(behindR, c1);
-        if (blockedBehind) return true;
+        if (behindR < 0 || behindR >= BOARD_SIZE || this.isBlockedByWall(r2, c1, behindR, c1) || this.isCellOccupied(behindR, c1)) return true;
       }
-
-      // Tentativa via vizinho horizontal (r1, c2)
-      if (
-        this.isCellOccupied(r1, c2) &&
-        !this.isBlockedByWall(r1, c1, r1, c2) &&
-        !this.isBlockedByWall(r1, c2, r2, c2)
-      ) {
+      if (this.isCellOccupied(r1, c2) && !this.isBlockedByWall(r1, c1, r1, c2) && !this.isBlockedByWall(r1, c2, r2, c2)) {
         const behindC = c2 + (c2 - c1);
-        const blockedBehind =
-          behindC < 0 ||
-          behindC >= BOARD_SIZE ||
-          this.isBlockedByWall(r1, c2, r1, behindC) ||
-          this.isCellOccupied(r1, behindC);
-        if (blockedBehind) return true;
+        if (behindC < 0 || behindC >= BOARD_SIZE || this.isBlockedByWall(r1, c2, r1, behindC) || this.isCellOccupied(r1, behindC)) return true;
       }
     }
-
     return false;
   }
 
-  /**
-   * Verifica se uma nova parede sobrepõe ou cruza no meio com alguma parede existente.
-   */
-  private doesWallOverlapOrCross(
-    row: number,
-    col: number,
-    orientation: WallOrientation
-  ): boolean {
+  private doesWallOverlapOrCross(row: number, col: number, orientation: WallOrientation): boolean {
     return this.state.walls.some((w) => {
-      // Cruzamento exato no mesmo ponto central (uma H e outra V na mesma âncora)
       if (w.row === row && w.col === col) return true;
-
-      // Sobreposição de 1 segmento na mesma orientação
       if (w.orientation === orientation) {
-        if (orientation === 'H' && w.row === row && Math.abs(w.col - col) === 1) {
-          return true;
-        }
-        if (orientation === 'V' && w.col === col && Math.abs(w.row - row) === 1) {
-          return true;
-        }
+        if (orientation === 'H' && w.row === row && Math.abs(w.col - col) === 1) return true;
+        if (orientation === 'V' && w.col === col && Math.abs(w.row - row) === 1) return true;
       }
       return false;
     });
   }
 
-  /**
-   * Verifica se o jogador atingiu sua linha ou coluna de vitória.
-   */
   private hasPlayerReachedGoal(player: Player): boolean {
     if (player.targetRow !== undefined && player.row === player.targetRow) return true;
     if (player.targetCol !== undefined && player.col === player.targetCol) return true;
     return false;
   }
 
-  /**
-   * Algoritmo de Busca em Largura (BFS) para garantir que o jogador possui pelo menos
-   * um caminho válido até sua borda de destino.
-   */
   private canPlayerReachGoalBFS(player: Player): boolean {
-    const visited = Array.from({ length: BOARD_SIZE }, () =>
-      Array(BOARD_SIZE).fill(false)
-    );
+    const visited = Array.from({ length: BOARD_SIZE }, () => Array(BOARD_SIZE).fill(false));
     const queue: [number, number][] = [[player.row, player.col]];
     visited[player.row][player.col] = true;
-
-    const dirs = [
-      [-1, 0],
-      [1, 0],
-      [0, -1],
-      [0, 1],
-    ];
+    const dirs = [[-1, 0], [1, 0], [0, -1], [0, 1]];
 
     while (queue.length > 0) {
       const [r, c] = queue.shift()!;
-
       if (player.targetRow !== undefined && r === player.targetRow) return true;
       if (player.targetCol !== undefined && c === player.targetCol) return true;
 
       for (const [dr, dc] of dirs) {
-        const nr = r + dr;
-        const nc = c + dc;
-        if (
-          nr >= 0 &&
-          nr < BOARD_SIZE &&
-          nc >= 0 &&
-          nc < BOARD_SIZE &&
-          !visited[nr][nc] &&
-          !this.isBlockedByWall(r, c, nr, nc)
-        ) {
+        const nr = r + dr, nc = c + dc;
+        if (nr >= 0 && nr < BOARD_SIZE && nc >= 0 && nc < BOARD_SIZE && !visited[nr][nc] && !this.isBlockedByWall(r, c, nr, nc)) {
           visited[nr][nc] = true;
           queue.push([nr, nc]);
         }
       }
     }
-
     return false;
+  }
+}
+
+/**
+ * OBJETO REMOTO DESPACHANTE (RMI Dispatcher / Manager).
+ * Expõe a interface RMI e multiplexa as requisições para a sala (GameInstance) correspondente.
+ */
+export class GameEngine implements IGameRemote {
+  /**
+   * Dicionário em memória que garante o isolamento físico/lógico entre sessões distintas.
+   */
+  private rooms: Map<string, GameInstance> = new Map();
+
+  public async createRoom(roomName: string): Promise<string> {
+    const roomId = randomUUID();
+    this.rooms.set(roomId, new GameInstance(roomId, roomName));
+    return roomId;
+  }
+
+  public async listRooms(): Promise<RoomInfo[]> {
+    const list: RoomInfo[] = [];
+    for (const [roomId, instance] of this.rooms.entries()) {
+      list.push({
+        roomId,
+        name: instance.state.roomName,
+        playersCount: instance.state.players.length,
+        status: instance.state.status,
+      });
+    }
+    return list;
+  }
+
+  /**
+   * Resolução de Roteamento Interno.
+   * @param roomId Chave de identificação da sessão.
+   */
+  private getRoom(roomId: string): GameInstance {
+    const room = this.rooms.get(roomId);
+    if (!room) {
+      throw new Error(`Referência RMI Inexistente: Instância da sala '${roomId}' não localizada no Registry.`);
+    }
+    return room;
+  }
+
+  public async joinGame(roomId: string, playerName: string) {
+    return this.getRoom(roomId).joinGame(playerName);
+  }
+
+  public async movePawn(roomId: string, playerId: string, targetRow: number, targetCol: number) {
+    return this.getRoom(roomId).movePawn(playerId, targetRow, targetCol);
+  }
+
+  public async placeWall(roomId: string, playerId: string, row: number, col: number, orientation: WallOrientation) {
+    return this.getRoom(roomId).placeWall(playerId, row, col, orientation);
+  }
+
+  public async getGameState(roomId: string) {
+    return this.getRoom(roomId).state;
+  }
+
+  public async resetGame(roomId: string) {
+    return this.getRoom(roomId).resetGame();
   }
 }
