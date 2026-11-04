@@ -10,7 +10,7 @@ Métodos Remotos (RMI/RPC)** sobre o paradigma **Solicitação/Resposta HTTP** �
 Sockets, WebSockets ou conexões TCP persistentes.
 
 > 📦 **Este repositório contém o PROCESSO SERVIDOR.** O processo cliente fica em
-> [`quoridor-rmi-web`](https://github.com/) — você precisa dos dois para jogar.
+> [`quoridor-rmi-web`](https://github.com/CibelleSousa/quoridor-rmi-web) — você precisa dos dois para jogar.
 
 ---
 
