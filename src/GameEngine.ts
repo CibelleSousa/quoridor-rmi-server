@@ -8,12 +8,11 @@ import {
   RoomInfo
 } from './IGameRemote';
 import { randomUUID } from 'crypto';
+import { MICRO_DROP_TIMEOUT_MS, ABANDON_WINDOW_MS, AUDIT_INTERVAL_MS } from './Config';
 
 const BOARD_SIZE = 9;
 const MAX_PLAYERS = 4;
 const INITIAL_WALLS_PER_PLAYER = 5;
-const MICRO_DROP_TIMEOUT_MS = 60000;
-const ABANDON_WINDOW_MS = 90000;
 
 /**
  * Matriz de configuração imutável para a geometria inicial de cada nó cliente (jogador).
@@ -43,7 +42,7 @@ class GameInstance {
 
   constructor(roomId: string, roomName: string) {
     this.state = this.createInitialState(roomId, roomName);
-    this.heartbeatInterval = setInterval(() => this.checkDisconnections(), 3000);
+    this.heartbeatInterval = setInterval(() => this.checkDisconnections(), AUDIT_INTERVAL_MS);
   }
 
   private createInitialState(roomId: string, roomName: string): GameState {
@@ -191,7 +190,7 @@ class GameInstance {
     this.state.lastActionDescription = 'Partida reiniciada! Tabuleiro limpo e barreiras restauradas.';
 
     clearInterval(this.heartbeatInterval);
-    this.heartbeatInterval = setInterval(() => this.checkDisconnections(), 3000);
+    this.heartbeatInterval = setInterval(() => this.checkDisconnections(), AUDIT_INTERVAL_MS);
 
     return this.state;
   }
