@@ -12,6 +12,8 @@ import { randomUUID } from 'crypto';
 const BOARD_SIZE = 9;
 const MAX_PLAYERS = 4;
 const INITIAL_WALLS_PER_PLAYER = 5;
+const MICRO_DROP_TIMEOUT_MS = 60000;
+const ABANDON_WINDOW_MS = 90000;
 
 /**
  * Matriz de configuração imutável para a geometria inicial de cada nó cliente (jogador).
@@ -32,14 +34,16 @@ const PLAYER_CONFIGS: {
 
 /**
  * CONTEXTO DE EXECUÇÃO ISOLADO (Game Instance).
- * Representa uma sessão de jogo específica. Esta classe não lida com a rede diretamente;
- * ela atua como a máquina de estados pura para as regras de negócio do Quoridor.
+ * Representa uma sessão de jogo específica. Mantém a máquina de estados do Quoridor e 
+ * um subsistema autônomo de auditoria de vivacidade (Liveness) dos clientes.
  */
 class GameInstance {
   public state: GameState;
+  private heartbeatInterval: NodeJS.Timeout;
 
   constructor(roomId: string, roomName: string) {
     this.state = this.createInitialState(roomId, roomName);
+    this.heartbeatInterval = setInterval(() => this.checkDisconnections(), 3000);
   }
 
   private createInitialState(roomId: string, roomName: string): GameState {
@@ -52,13 +56,13 @@ class GameInstance {
       currentTurnIndex: 0,
       status: 'WAITING_PLAYERS',
       winner: null,
-      lastActionDescription: 'Aguardando alocação de processos clientes remotos...',
+      lastActionDescription: 'Aguardando os 4 jogadores se conectarem...',
     };
   }
 
   public async joinGame(playerName: string): Promise<{ player: Player; state: GameState }> {
     if (this.state.players.length >= MAX_PLAYERS) {
-      throw new Error('Capacidade da sala esgotada (máximo de 4 conexões).');
+      throw new Error('Capacidade da sala esgotada (máximo de 4 jogadores).');
     }
 
     const idx = this.state.players.length;
@@ -73,13 +77,15 @@ class GameInstance {
       targetRow: cfg.targetRow,
       targetCol: cfg.targetCol,
       wallsRemaining: INITIAL_WALLS_PER_PLAYER,
+      connectionStatus: 'ONLINE',
+      lastSeen: Date.now()
     };
 
     this.state.players.push(newPlayer);
 
     if (this.state.players.length === MAX_PLAYERS) {
       this.state.status = 'IN_PROGRESS';
-      this.state.lastActionDescription = `Quorum atingido. Turno inicial transferido para ${this.state.players[0].name}.`;
+      this.state.lastActionDescription = `Os 4 jogadores entraram! Vez de ${this.state.players[0].name}.`;
     } else {
       this.state.lastActionDescription = `${newPlayer.name} vinculado à sessão (${this.state.players.length}/${MAX_PLAYERS}).`;
     }
@@ -87,30 +93,36 @@ class GameInstance {
     return { player: newPlayer, state: this.state };
   }
 
+  public async rejoinGame(playerId: string): Promise<GameState> {
+    this.registerActivity(playerId);
+    return this.state;
+  }
+
   public async movePawn(playerId: string, targetRow: number, targetCol: number): Promise<GameState> {
+    this.registerActivity(playerId);
     this.validateTurn(playerId);
     const currentPlayer = this.state.players[this.state.currentTurnIndex];
 
     if (targetRow < 0 || targetRow >= BOARD_SIZE || targetCol < 0 || targetCol >= BOARD_SIZE) {
-      throw new Error('Exceção geométrica: Coordenadas violam os limites do espaço 9x9.');
+      throw new Error('Coordenadas fora dos limites do tabuleiro 9x9.');
     }
 
     if (this.isCellOccupied(targetRow, targetCol)) {
-      throw new Error('Violação de estado: O vértice de destino já está alocado.');
+      throw new Error('Já existe um peão (ativo ou fantasma) ocupando esta casa!');
     }
 
     if (!this.isValidPawnMove(currentPlayer.row, currentPlayer.col, targetRow, targetCol)) {
-      throw new Error('Transição inválida segundo as regras de topologia do Quoridor.');
+      throw new Error('Movimento inválido! Mova 1 casa ortogonal sem atravessar paredes (ou pule um peão adjacente).');
     }
 
     currentPlayer.row = targetRow;
     currentPlayer.col = targetCol;
-    this.state.lastActionDescription = `${currentPlayer.name} transicionou para (${targetRow + 1}, ${targetCol + 1}).`;
+    this.state.lastActionDescription = `${currentPlayer.name} moveu o peão para (${targetRow + 1}, ${targetCol + 1}).`;
 
     if (this.hasPlayerReachedGoal(currentPlayer)) {
       this.state.status = 'FINISHED';
       this.state.winner = currentPlayer;
-      this.state.lastActionDescription = `🏆 Condição de parada atingida. ${currentPlayer.name} venceu a sessão!`;
+      this.state.lastActionDescription = `🏆 ${currentPlayer.name} alcançou o lado oposto e venceu a partida!`;
     } else {
       this.advanceTurn();
     }
@@ -118,46 +130,48 @@ class GameInstance {
     return this.state;
   }
 
-  public async placeWall(
-    playerId: string,
-    row: number,
-    col: number,
-    orientation: WallOrientation
-  ): Promise<GameState> {
+  public async placeWall( playerId: string, row: number, col: number, orientation: WallOrientation ): Promise<GameState> {
+    
+    this.registerActivity(playerId);
     this.validateTurn(playerId);
+
     const currentPlayer = this.state.players[this.state.currentTurnIndex];
 
     if (currentPlayer.wallsRemaining <= 0) {
-      throw new Error('Recursos esgotados: Cota de barreiras do nó atingida.');
+      throw new Error('Você não possui mais barreiras disponíveis!');
     }
 
     if (row < 0 || row > 7 || col < 0 || col > 7) {
-      throw new Error('Vetor de posicionamento inválido.');
+      throw new Error('Coordenadas de parede inválidas.');
     }
 
     if (this.doesWallOverlapOrCross(row, col, orientation)) {
-      throw new Error('Colisão detectada na matriz geométrica do tabuleiro.');
+      throw new Error('Esta posição colide ou cruza com uma barreira já existente!');
     }
 
     const candidateWall: Wall = { row, col, orientation, ownerId: currentPlayer.id };
     this.state.walls.push(candidateWall);
 
     // Validação de Grafo: Garante que o grafo permaneça conexo para o objetivo de todos os nós
+    const activePlayers = this.state.players.filter(p => p.connectionStatus !== 'ABANDONED');
     const allPlayersCanReachGoal = this.state.players.every((p) => this.canPlayerReachGoalBFS(p));
 
     if (!allPlayersCanReachGoal) {
       this.state.walls.pop();
-      throw new Error('Bloqueio Ilegal de Rota (Regra anti-deadlock): Todos os nós devem ter um caminho válido.');
+      throw new Error('Regra anti-deadlock: É proibido trancar completamente o caminho de um jogador ativo até o objetivo!');
     }
 
     currentPlayer.wallsRemaining -= 1;
-    this.state.lastActionDescription = `${currentPlayer.name} instanciou uma barreira ${orientation} em (${row + 1}, ${col + 1}).`;
+    this.state.lastActionDescription = `${currentPlayer.name} posicionou uma parede ${orientation} em (${row + 1}, ${col + 1}).`;
 
     this.advanceTurn();
     return this.state;
   }
 
-  public async getGameState(): Promise<GameState> {
+  public async getGameState(playerId?: string): Promise<GameState> {
+    if (playerId) {
+      this.registerActivity(playerId);
+    }
     return this.state;
   }
 
@@ -174,19 +188,106 @@ class GameInstance {
     });
 
     this.state.status = this.state.players.length === MAX_PLAYERS ? 'IN_PROGRESS' : 'WAITING_PLAYERS';
-    this.state.lastActionDescription = 'Reset de sessão concluído com sucesso.';
+    this.state.lastActionDescription = 'Partida reiniciada! Tabuleiro limpo e barreiras restauradas.';
+
+    clearInterval(this.heartbeatInterval);
+    this.heartbeatInterval = setInterval(() => this.checkDisconnections(), 3000);
 
     return this.state;
   }
 
-  // --- Métodos privados utilitários e de heurística do Grafo foram mantidos exatos como na refatoração ---
+  // --- SUBSISTEMA DE TOLERÂNCIA: JANELA DE PAUSA 90s, W.O. E PEÃO FANTASMA ---
+
+  /**
+   * Atualiza o timestamp de última atividade do nó cliente.
+   */
+  private registerActivity(playerId: string): void {
+    const player = this.state.players.find(p => p.id === playerId);
+    if (player && player.connectionStatus !== 'ABANDONED') {
+      player.lastSeen = Date.now();
+
+      if(player.connectionStatus === 'OFFLINE'){
+        player.connectionStatus = 'ONLINE';
+        player.offlineSince = undefined;
+        this.checkDisconnections();
+      }
+    }
+  }
+
+  /**
+   * Varredura periódica de auditoria para detectar partições de rede ou falhas (crashes) nos clientes.
+   */
+  private checkDisconnections(): void {
+    if (this.state.status === 'WAITING_PLAYERS' || this.state.status === 'FINISHED') return;
+
+    const now = Date.now();
+    let stateChanged = false;
+
+    this.state.players.forEach(p => {
+      if (p.connectionStatus === 'ONLINE' && (now - p.lastSeen > MICRO_DROP_TIMEOUT_MS)) {
+        p.connectionStatus = 'OFFLINE';
+        p.offlineSince = now;
+        stateChanged = true;
+      } else if (p.connectionStatus === 'OFFLINE' && p.offlineSince && (now - p.offlineSince > ABANDON_WINDOW_MS)) {
+        p.connectionStatus = 'ABANDONED'; // Virou Peão Fantasma
+        stateChanged = true;
+      }
+    });
+
+    if (stateChanged || this.state.status === 'PAUSED_DISCONNECT') {
+      const remainingPlayers = this.state.players.filter(p => p.connectionStatus !== 'ABANDONED');
+      
+      // Regra 1: Se 3 desistiram, o único sobrevivente vence por W.O.
+      if (remainingPlayers.length <= 1) {
+        const survivor = remainingPlayers.length === 1 ? remainingPlayers[0] : null;
+        this.finishGame(survivor, survivor ? `🏆 ${survivor.name} venceu por W.O. (os adversários abandonaram).` : 'Partida encerrada.');
+        return;
+      }
+
+      const anyOffline = remainingPlayers.some(p => p.connectionStatus === 'OFFLINE');
+
+      // Regra 2: Alguém caiu? Pausa estratégica de 90s.
+      if (anyOffline) {
+        this.state.status = 'PAUSED_DISCONNECT';
+        const offlineNames = remainingPlayers.filter(p => p.connectionStatus === 'OFFLINE').map(p => p.name).join(', ');
+        this.state.lastActionDescription = `⚠️ Pausa Estratégica: Aguardando reconexão de ${offlineNames} (Janela de 90s)...`;
+      } 
+      // Regra 3: Ninguém Offline? Retoma o jogo.
+      else {
+        if (this.state.status === 'PAUSED_DISCONNECT') {
+          this.state.status = 'IN_PROGRESS';
+          this.state.lastActionDescription = `✅ A partida foi retomada!`;
+          
+          // Se o turno atual era de alguém que virou Fantasma, avança automaticamente
+          if (this.state.players[this.state.currentTurnIndex].connectionStatus === 'ABANDONED') {
+            this.advanceTurn();
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Interrompe a máquina de estados e cessa o consumo de CPU da instância.
+   */
+  private finishGame(winner: Player | null, message: string): void {
+    this.state.status = 'FINISHED';
+    this.state.winner = winner;
+    this.state.lastActionDescription = message;
+    clearInterval(this.heartbeatInterval);
+  }
+
+  // --- VALIDAÇÕES GEOMÉTRICAS E ALGORITMOS DE GRAFO (QUORIDOR) ---
 
   private validateTurn(playerId: string): void {
     if (this.state.status === 'WAITING_PLAYERS') {
-      throw new Error('Estado prematuro: Aguardando sincronização do quorum de 4 processos.');
+      throw new Error('Aguardando os 4 jogadores.');
+    }
+    if (this.state.status === 'PAUSED_DISCONNECT') {
+      throw new Error('Ações bloqueadas durante a janela de reconexão (90s).');
     }
     if (this.state.status === 'FINISHED') {
-      throw new Error('Estado finalizado: A sessão não aceita novas transições.');
+      throw new Error('A partida já foi encerrada.');
     }
 
     const currentPlayer = this.state.players[this.state.currentTurnIndex];
@@ -195,8 +296,15 @@ class GameInstance {
     }
   }
 
+  /**
+   * Realiza o avanço circular de turno, saltando automaticamente os nós inativos (desconectados).
+   */
   private advanceTurn(): void {
-    this.state.currentTurnIndex = (this.state.currentTurnIndex + 1) % MAX_PLAYERS;
+    let attempts = 0;
+    do {
+      this.state.currentTurnIndex = (this.state.currentTurnIndex + 1) % MAX_PLAYERS;
+      attempts++;
+    } while (this.state.players[this.state.currentTurnIndex].connectionStatus === 'ABANDONED' && attempts < MAX_PLAYERS);
   }
 
   private isCellOccupied(r: number, c: number): boolean {
@@ -327,6 +435,10 @@ export class GameEngine implements IGameRemote {
     return this.getRoom(roomId).joinGame(playerName);
   }
 
+  public async rejoinGame(roomId: string, playerId: string) {
+    return this.getRoom(roomId).rejoinGame(playerId);
+  }
+
   public async movePawn(roomId: string, playerId: string, targetRow: number, targetCol: number) {
     return this.getRoom(roomId).movePawn(playerId, targetRow, targetCol);
   }
@@ -335,8 +447,14 @@ export class GameEngine implements IGameRemote {
     return this.getRoom(roomId).placeWall(playerId, row, col, orientation);
   }
 
-  public async getGameState(roomId: string) {
-    return this.getRoom(roomId).state;
+  /**
+   * Encaminha o polling de estado para a sala correta.
+   * O `playerId` é repassado adiante porque é ele que alimenta o Heartbeat: a própria
+   * requisição de leitura funciona como sinal de vida do nó cliente. Omiti-lo aqui faria
+   * todos os jogadores expirarem por inatividade mesmo estando ativos.
+   */
+  public async getGameState(roomId: string, playerId?: string) {
+    return this.getRoom(roomId).getGameState(playerId);
   }
 
   public async resetGame(roomId: string) {

@@ -1,8 +1,8 @@
 {
-  "name": "tictactoe-rmi-server",
+  "name": "quoridor-rmi-server",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Servidor RMI do Quoridor distribuido: objeto remoto, registry de salas e apendice do servidor (skeleton) sobre HTTP Request/Reply.",
+  "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
@@ -17,5 +17,8 @@
   },
   "allowScripts": {
     "esbuild@0.28.2": true
+  },
+  "engines": {
+    "node": ">=20.9.0"
   }
 }

@@ -27,6 +27,7 @@ export interface Wall {
 
 /**
  * Representa o estado de um nó cliente (jogador) na partida de Quoridor.
+ * Inclui metadados de tolerância a falhas (Heartbeat/Liveness).
  */
 export interface Player {
   id: string;
@@ -37,6 +38,9 @@ export interface Player {
   targetRow?: number;
   targetCol?: number;
   wallsRemaining: number;
+  connectionStatus: 'ONLINE' | 'OFFLINE' | 'ABANDONED';
+  lastSeen: number;
+  offlineSince?: number;
 }
 
 /**
@@ -46,7 +50,7 @@ export interface RoomInfo {
   roomId: string;
   name: string;
   playersCount: number;
-  status: 'WAITING_PLAYERS' | 'IN_PROGRESS' | 'FINISHED';
+  status: 'WAITING_PLAYERS' | 'IN_PROGRESS' | 'PAUSED_DISCONNECT' | 'FINISHED';
 }
 
 /**
@@ -59,7 +63,7 @@ export interface GameState {
   players: Player[];
   walls: Wall[];
   currentTurnIndex: number;
-  status: 'WAITING_PLAYERS' | 'IN_PROGRESS' | 'FINISHED';
+  status: 'WAITING_PLAYERS' | 'IN_PROGRESS' | 'PAUSED_DISCONNECT' | 'FINISHED';
   winner: Player | null;
   lastActionDescription: string;
 }
@@ -90,6 +94,8 @@ export interface IGameRemote {
    * @returns Os dados do jogador instanciado e o estado atualizado da sala.
    */
   joinGame(roomId: string, playerName: string): Promise<{ player: Player; state: GameState }>;
+
+  rejoinGame(roomId: string, playerId: string): Promise<GameState>;
 
   /**
    * Injeta um evento de movimentação no estado da instância isolada.
@@ -123,7 +129,7 @@ export interface IGameRemote {
    * @param roomId Chave de roteamento da sala.
    * @returns A fotografia atual (snapshot) do estado da partida.
    */
-  getGameState(roomId: string): Promise<GameState>;
+  getGameState(roomId: string, playerId?: string): Promise<GameState>;
 
   /**
    * Emite comando para reinicializar a máquina de estados da partida correspondente.
