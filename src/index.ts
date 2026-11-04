@@ -1,6 +1,7 @@
 import http from 'http';
 import { GameEngine } from './GameEngine';
 import { ServerStub } from './ServerStub';
+import { descreverPerfilDeTempo } from './Config';
 
 const PORT = process.env.PORT || 4000;
 
@@ -65,5 +66,6 @@ server.listen(PORT, () => {
   console.log(`🚀 Servidor RMI Quoridor (Lobby e Múltiplas Salas) na porta ${PORT}`);
   console.log(`🔗 Endpoint de Invocação Remota: http://localhost:${PORT}/rmi`);
   console.log(`📦 Objeto Remoto Registrado: LobbyManager -> IGameRemote`);
+  console.log(descreverPerfilDeTempo());
   console.log(`==============================================================`);
 });
